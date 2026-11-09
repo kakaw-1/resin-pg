@@ -1,0 +1,87 @@
+name: Publish container image
+
+# Builds the single-container image from the root Dockerfile (Node builds the
+# WebUI, Go builds the binary, Alpine runs it) and publishes it to GHCR.
+#
+# Tag pushes are intentionally NOT used as a trigger: this repository still
+# carries upstream's release.yml, which reacts to "v*" tags and would start a
+# five-platform binary release. The image version lives in RESIN_VERSION below.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RESIN_VERSION: pg-v1.3.0-1
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ env.RESIN_VERSION }}
+            ghcr.io/${{ github.repository }}:sha-${{ steps.tags.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=resin-pg
+            org.opencontainers.image.description=Resin with an external PostgreSQL backend for config and runtime state
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.RESIN_VERSION }}
+          build-args: |
+            VERSION=${{ env.RESIN_VERSION }}
+            GIT_COMMIT=${{ steps.tags.outputs.short_sha }}
+            BUILD_TIME=${{ steps.tags.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Summary
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository }}:${{ env.RESIN_VERSION }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository }}:sha-${{ steps.tags.outputs.short_sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
