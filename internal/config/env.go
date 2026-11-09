@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,18 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
 	ProxyBypassRules                                []string
+
+	// Persistence backend (state + cache). SQLite is the default; PostgreSQL
+	// keeps the same data in two schemas of one external database. Metrics and
+	// request logs are unaffected by this switch and stay on local files.
+	DBDriver          string
+	DBDSN             string
+	DBStateSchema     string
+	DBCacheSchema     string
+	DBMaxOpenConns    int
+	DBMaxIdleConns    int
+	DBConnMaxLifetime time.Duration
+	DBConnectTimeout  time.Duration
 
 	// Request log
 	RequestLogQueueSize           int
@@ -126,6 +139,16 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
 	cfg.ProxyBypassRules = envDelimitedStringSlice("RESIN_PROXY_BYPASS", []string{})
+
+	// --- Persistence backend ---
+	cfg.DBDriver = strings.ToLower(strings.TrimSpace(envStr("RESIN_DB_DRIVER", "sqlite")))
+	cfg.DBDSN = strings.TrimSpace(envStr("RESIN_DB_DSN", ""))
+	cfg.DBStateSchema = strings.TrimSpace(envStr("RESIN_DB_STATE_SCHEMA", "resin_state"))
+	cfg.DBCacheSchema = strings.TrimSpace(envStr("RESIN_DB_CACHE_SCHEMA", "resin_cache"))
+	cfg.DBMaxOpenConns = envInt("RESIN_DB_MAX_OPEN_CONNS", 0, &errs)
+	cfg.DBMaxIdleConns = envInt("RESIN_DB_MAX_IDLE_CONNS", 0, &errs)
+	cfg.DBConnMaxLifetime = envDuration("RESIN_DB_CONN_MAX_LIFETIME", 0, &errs)
+	cfg.DBConnectTimeout = envDuration("RESIN_DB_CONNECT_TIMEOUT", 0, &errs)
 
 	// --- Request log ---
 	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)
@@ -307,6 +330,44 @@ func LoadEnvConfig() (*EnvConfig, error) {
 		errs = append(errs, "RESIN_REQUEST_LOG_QUEUE_SIZE must be at least 2x RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE")
 	}
 
+	// --- Persistence backend validation ---
+	switch cfg.DBDriver {
+	case "sqlite":
+		if cfg.DBDSN != "" {
+			errs = append(errs, "RESIN_DB_DSN must not be set when RESIN_DB_DRIVER=sqlite (set RESIN_DB_DRIVER=postgres to use an external database)")
+		}
+	case "postgres":
+		if cfg.DBDSN == "" {
+			errs = append(errs, "RESIN_DB_DSN is required when RESIN_DB_DRIVER=postgres")
+		}
+		if !dbSchemaIdentifier.MatchString(cfg.DBStateSchema) {
+			errs = append(errs, fmt.Sprintf("RESIN_DB_STATE_SCHEMA: invalid identifier %q", cfg.DBStateSchema))
+		}
+		if !dbSchemaIdentifier.MatchString(cfg.DBCacheSchema) {
+			errs = append(errs, fmt.Sprintf("RESIN_DB_CACHE_SCHEMA: invalid identifier %q", cfg.DBCacheSchema))
+		}
+		if cfg.DBStateSchema == cfg.DBCacheSchema {
+			errs = append(errs, "RESIN_DB_STATE_SCHEMA and RESIN_DB_CACHE_SCHEMA must differ")
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("RESIN_DB_DRIVER: invalid value %q (allowed: sqlite, postgres)", cfg.DBDriver))
+	}
+	if cfg.DBMaxOpenConns < 0 {
+		errs = append(errs, "RESIN_DB_MAX_OPEN_CONNS must not be negative")
+	}
+	if cfg.DBMaxIdleConns < 0 {
+		errs = append(errs, "RESIN_DB_MAX_IDLE_CONNS must not be negative")
+	}
+	if cfg.DBMaxOpenConns > 0 && cfg.DBMaxIdleConns > cfg.DBMaxOpenConns {
+		errs = append(errs, "RESIN_DB_MAX_IDLE_CONNS must be less than or equal to RESIN_DB_MAX_OPEN_CONNS")
+	}
+	if cfg.DBConnMaxLifetime < 0 {
+		errs = append(errs, "RESIN_DB_CONN_MAX_LIFETIME must not be negative")
+	}
+	if cfg.DBConnectTimeout < 0 {
+		errs = append(errs, "RESIN_DB_CONNECT_TIMEOUT must not be negative")
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config validation failed:\n  %s", strings.Join(errs, "\n  "))
 	}
@@ -315,6 +376,9 @@ func LoadEnvConfig() (*EnvConfig, error) {
 }
 
 // --- helpers ---
+
+// dbSchemaIdentifier constrains schema names used in PostgreSQL identifiers.
+var dbSchemaIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
 
 func envStr(key, defaultVal string) string {
 	if v, ok := os.LookupEnv(key); ok {

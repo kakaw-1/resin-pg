@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -57,6 +58,58 @@ func RepairConsistency(stateDBPath string, cacheDB *sql.DB) error {
 
 	for i, s := range stmts {
 		if _, err := tx.Exec(s); err != nil {
+			return fmt.Errorf("repair step %d: %w", i+1, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// repairConsistencyPostgres performs the same orphan cleanup as RepairConsistency
+// for a PostgreSQL deployment. PostgreSQL has no ATTACH, but both stores live in
+// the same database under different schemas, so schema-qualified names provide
+// the cross-store join and everything still runs in one transaction.
+//
+// Boolean columns are compared to false rather than 0.
+func repairConsistencyPostgres(cacheDB *sql.DB, stateSchema string) error {
+	if err := validateSchemaIdentifier("state", stateSchema); err != nil {
+		return err
+	}
+	state := quoteIdentifier(stateSchema)
+
+	stmts := []string{
+		// 1. subscription_nodes: orphan subscription or orphan node
+		fmt.Sprintf(`DELETE FROM subscription_nodes
+		 WHERE subscription_id NOT IN (SELECT id FROM %s.subscriptions)
+		    OR (evicted = false AND node_hash NOT IN (SELECT hash FROM nodes_static))`, state),
+
+		// 2. nodes_static: no subscription references
+		`DELETE FROM nodes_static
+		 WHERE hash NOT IN (SELECT node_hash FROM subscription_nodes WHERE evicted = false)`,
+
+		// 3. nodes_dynamic: orphan to nodes_static
+		`DELETE FROM nodes_dynamic
+		 WHERE hash NOT IN (SELECT hash FROM nodes_static)`,
+
+		// 4. node_latency: orphan to nodes_static
+		`DELETE FROM node_latency
+		 WHERE node_hash NOT IN (SELECT hash FROM nodes_static)`,
+
+		// 5. leases: orphan platform or orphan node
+		fmt.Sprintf(`DELETE FROM leases
+		 WHERE platform_id NOT IN (SELECT id FROM %s.platforms)
+		    OR node_hash NOT IN (SELECT hash FROM nodes_static)`, state),
+	}
+
+	ctx := context.Background()
+	tx, err := cacheDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin repair tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	for i, s := range stmts {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("repair step %d: %w", i+1, err)
 		}
 	}

@@ -23,6 +23,10 @@ type StateRepo struct {
 	mu sync.Mutex
 }
 
+// DB exposes the underlying handle. Used by the db-migrate command and by
+// health/diagnostic tooling; the repos themselves never hand it to callers.
+func (r *StateRepo) DB() *sql.DB { return r.db }
+
 // newStateRepo creates a StateRepo for the given state.db connection.
 func newStateRepo(db *sql.DB) *StateRepo {
 	return &StateRepo{db: db}
@@ -169,12 +173,39 @@ func (r *StateRepo) UpsertPlatform(p model.Platform) error {
 		p.ReverseProxyMissAction, p.ReverseProxyEmptyAccountBehavior, p.ReverseProxyFixedAccountHeader,
 		p.AllocationPolicy, p.PassiveCircuitBreakerDisabled, p.UpdatedAtNs)
 	if err != nil {
-		if isSQLiteUniqueConstraint(err) {
+		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: platform name already exists", ErrConflict)
 		}
 		return err
 	}
 	return err
+}
+
+// boolParam is a bool that accepts both storage representations Resin uses for
+// boolean columns: BOOLEAN on PostgreSQL and INTEGER 0/1 on SQLite.
+type boolParam bool
+
+// Scan implements sql.Scanner.
+func (b *boolParam) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		*b = false
+	case bool:
+		*b = boolParam(v)
+	case int64:
+		*b = boolParam(v != 0)
+	case int32:
+		*b = boolParam(v != 0)
+	case int:
+		*b = boolParam(v != 0)
+	case []byte:
+		*b = boolParam(len(v) > 0 && (v[0] == '1' || v[0] == 't' || v[0] == 'T'))
+	case string:
+		*b = boolParam(v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "t"))
+	default:
+		return fmt.Errorf("scan boolean: unsupported source type %T", src)
+	}
+	return nil
 }
 
 func isSQLiteUniqueConstraint(err error) bool {
@@ -228,7 +259,7 @@ func (r *StateRepo) GetPlatform(id string) (*model.Platform, error) {
 
 	var p model.Platform
 	var regexFiltersJSON, regionFiltersJSON string
-	var passiveCircuitBreakerDisabled int
+	var passiveCircuitBreakerDisabled boolParam
 	if err := row.Scan(&p.ID, &p.Name, &p.StickyTTLNs, &regexFiltersJSON,
 		&regionFiltersJSON, &p.ReverseProxyMissAction, &p.ReverseProxyEmptyAccountBehavior,
 		&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled, &p.UpdatedAtNs); err != nil {
@@ -237,7 +268,7 @@ func (r *StateRepo) GetPlatform(id string) (*model.Platform, error) {
 		}
 		return nil, err
 	}
-	p.PassiveCircuitBreakerDisabled = passiveCircuitBreakerDisabled != 0
+	p.PassiveCircuitBreakerDisabled = bool(passiveCircuitBreakerDisabled)
 	regexFilters, err := decodeStringSliceJSON(regexFiltersJSON)
 	if err != nil {
 		return nil, fmt.Errorf("decode platform %s regex_filters_json: %w", p.ID, err)
@@ -263,13 +294,13 @@ func (r *StateRepo) ListPlatforms() ([]model.Platform, error) {
 	for rows.Next() {
 		var p model.Platform
 		var regexFiltersJSON, regionFiltersJSON string
-		var passiveCircuitBreakerDisabled int
+		var passiveCircuitBreakerDisabled boolParam
 		if err := rows.Scan(&p.ID, &p.Name, &p.StickyTTLNs, &regexFiltersJSON,
 			&regionFiltersJSON, &p.ReverseProxyMissAction, &p.ReverseProxyEmptyAccountBehavior,
 			&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled, &p.UpdatedAtNs); err != nil {
 			return nil, err
 		}
-		p.PassiveCircuitBreakerDisabled = passiveCircuitBreakerDisabled != 0
+		p.PassiveCircuitBreakerDisabled = bool(passiveCircuitBreakerDisabled)
 		regexFilters, err := decodeStringSliceJSON(regexFiltersJSON)
 		if err != nil {
 			return nil, fmt.Errorf("decode platform %s regex_filters_json: %w", p.ID, err)
@@ -380,7 +411,7 @@ func (r *StateRepo) InsertEndpoint(endpoint model.Endpoint) error {
 	`, endpoint.ID, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
 		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
 		endpoint.AllowSOCKS5, endpoint.CreatedAtNs, endpoint.UpdatedAtNs)
-	if isSQLiteUniqueConstraint(err) {
+	if isUniqueViolation(err) {
 		return fmt.Errorf("%w: endpoint id or port already exists", ErrConflict)
 	}
 	return err
@@ -406,7 +437,7 @@ func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
 	`, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
 		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
 		endpoint.AllowSOCKS5, endpoint.UpdatedAtNs, endpoint.ID)
-	if isSQLiteUniqueConstraint(err) {
+	if isUniqueViolation(err) {
 		return fmt.Errorf("%w: endpoint port already exists", ErrConflict)
 	}
 	if err != nil {
@@ -479,8 +510,8 @@ type endpointScanner func(dest ...any) error
 
 func scanEndpoint(scan endpointScanner) (model.Endpoint, error) {
 	var endpoint model.Endpoint
-	var enabled, allowManagement, allowProxy, requireProxyAuthInfo int
-	var allowHTTPForward, allowHTTPReverse, allowSOCKS5 int
+	var enabled, allowManagement, allowProxy, requireProxyAuthInfo boolParam
+	var allowHTTPForward, allowHTTPReverse, allowSOCKS5 boolParam
 	err := scan(
 		&endpoint.ID,
 		&endpoint.Port,
@@ -497,13 +528,13 @@ func scanEndpoint(scan endpointScanner) (model.Endpoint, error) {
 	if err != nil {
 		return model.Endpoint{}, err
 	}
-	endpoint.Enabled = enabled != 0
-	endpoint.AllowManagement = allowManagement != 0
-	endpoint.AllowProxy = allowProxy != 0
-	endpoint.RequireProxyAuthInfo = requireProxyAuthInfo != 0
-	endpoint.AllowHTTPForward = allowHTTPForward != 0
-	endpoint.AllowHTTPReverse = allowHTTPReverse != 0
-	endpoint.AllowSOCKS5 = allowSOCKS5 != 0
+	endpoint.Enabled = bool(enabled)
+	endpoint.AllowManagement = bool(allowManagement)
+	endpoint.AllowProxy = bool(allowProxy)
+	endpoint.RequireProxyAuthInfo = bool(requireProxyAuthInfo)
+	endpoint.AllowHTTPForward = bool(allowHTTPForward)
+	endpoint.AllowHTTPReverse = bool(allowHTTPReverse)
+	endpoint.AllowSOCKS5 = bool(allowSOCKS5)
 	return endpoint, nil
 }
 

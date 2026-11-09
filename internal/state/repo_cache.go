@@ -13,6 +13,10 @@ type CacheRepo struct {
 	db *sql.DB
 }
 
+// DB exposes the underlying handle. Used by the db-migrate command and by
+// health/diagnostic tooling; the repos themselves never hand it to callers.
+func (r *CacheRepo) DB() *sql.DB { return r.db }
+
 // newCacheRepo creates a CacheRepo for the given cache.db connection.
 func newCacheRepo(db *sql.DB) *CacheRepo {
 	return &CacheRepo{db: db}
@@ -358,7 +362,30 @@ type FlushOps struct {
 //
 // Upsert order: nodes_static → subscription_nodes → nodes_dynamic → node_latency → leases
 // Delete order: leases → node_latency → nodes_dynamic → subscription_nodes → nodes_static
+//
+// On a networked backend a batch flush can lose a race with a concurrent
+// transaction (serialization failure or deadlock). The whole batch is replayed in
+// that case; the operation set is idempotent because every write is an upsert or
+// a delete by primary key.
 func (r *CacheRepo) FlushTx(ops FlushOps) error {
+	const maxAttempts = 3
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := r.flushTxOnce(ops)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableTxError(err) {
+			return err
+		}
+		sleepBeforeRetry(attempt)
+	}
+	return lastErr
+}
+
+func (r *CacheRepo) flushTxOnce(ops FlushOps) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin flush tx: %w", err)

@@ -590,6 +590,18 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 
 数据库 schema 使用 golang-migrate 做版本化 migration。无法无损映射到旧数据模型的 migration 不提供 down 文件；降级时必须恢复升级前的数据库备份。
 
+### 存储后端（SQLite / PostgreSQL）
+state.db 与 cache.db 的物理位置由 `RESIN_DB_DRIVER` 决定，默认 `sqlite`；设为 `postgres` 时两者落在同一个 PostgreSQL 数据库的两个 schema（`RESIN_DB_STATE_SCHEMA` / `RESIN_DB_CACHE_SCHEMA`，默认 `resin_state` / `resin_cache`），首次启动自动建 schema 并跑迁移。
+
+* 迁移：`internal/state/migrations/{state,cache}` 是 SQLite 集，`internal/state/migrations/postgres/{state,cache}` 是 PostgreSQL 集，版本号一一对应（state 9 个、cache 2 个），由 `migrate.go` 按驱动选择 iofs 源与 golang-migrate 的 db driver。
+* 占位符：仓库里的 SQL 一律写 `?`；PostgreSQL 驱动在 `internal/state/pgdriver.go` 里做词法级重写（跳过字符串、标识符、注释与 `$tag$` 块），因此两个后端共用同一份 SQL 与同一套测试。
+* 类型契约：布尔列在 PostgreSQL 用 `BOOLEAN`、SQLite 用 `INTEGER 0/1`，Go 侧统一 bool；纳秒时间戳一律 `BIGINT`；JSON 列保持 `TEXT`（不换 `JSONB`），避免每个 Scan 点都要改。
+* 跨库一致性：SQLite 版用 `ATTACH state.db` 在一条事务里做孤儿清理；PostgreSQL 版改用 schema 限定名 JOIN，语义等价，前提是 state 与 cache 在同一个数据库。
+* 单写者与连接池：SQLite 保持 `MaxOpenConns=1`；PostgreSQL 默认 8/4，脏集批量 flush 仍由单个 worker 串行执行，遇到 `40001`/`40P01` 时整批重放（写入均为 upsert/按主键删除，天然幂等）。
+* 数据搬迁：`resin db-migrate` 子命令逐表 upsert 搬运，支持 `--dry-run` 与搬后行数核对。
+
+指标库（`metrics.db`）与请求日志库（`request_logs-*.db`）**不参与**该开关，始终保存在 `RESIN_LOG_DIR` 本地：它们按大小轮转、寿命短、随流量增长，放进外部库只会拖慢写路径。
+
 ### SQLite 数据模型
 #### state.db
 * system_config(config_json, version, updated_at_ns)

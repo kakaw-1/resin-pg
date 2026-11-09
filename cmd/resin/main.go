@@ -46,6 +46,12 @@ type topologyRuntime struct {
 const downloadUserAgent = "clash.meta"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "db-migrate" {
+		if err := runDBMigrate(os.Args[2:]); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fatalf("%v", err)
 	}

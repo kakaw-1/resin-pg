@@ -351,6 +351,73 @@ RESIN_PORT=2260 \
 
 ---
 
+## 🗄️ 外部数据库（PostgreSQL）
+
+默认情况下 Resin 用本地 SQLite：`state.db`（配置、平台、订阅、规则、端点）与 `cache.db`（节点健康、延迟、租约）。把这两个库换成外部 PostgreSQL 之后，配置与运行状态可以跨容器、跨机器共享，容器重建不再丢数据。
+
+**范围说明**：只有「配置 + 状态」会外置。请求日志（`request_logs-*.db`，按大小轮转）和指标（`metrics.db`）**始终保存在本地 `RESIN_LOG_DIR`**，不受本开关影响。
+
+### 配置项
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RESIN_DB_DRIVER` | `sqlite` | `sqlite` 或 `postgres` |
+| `RESIN_DB_DSN` | 空 | PostgreSQL 连接串，`postgres://user:pw@host:5432/db?sslmode=disable`；`driver=postgres` 时必填 |
+| `RESIN_DB_STATE_SCHEMA` | `resin_state` | 强持久库所在 schema（启动时自动 `CREATE SCHEMA`） |
+| `RESIN_DB_CACHE_SCHEMA` | `resin_cache` | 弱持久库所在 schema |
+| `RESIN_DB_MAX_OPEN_CONNS` | 0（postgres 取 8） | 最大连接数 |
+| `RESIN_DB_MAX_IDLE_CONNS` | 0（postgres 取 4） | 最大空闲连接数 |
+| `RESIN_DB_CONN_MAX_LIFETIME` | 0（取 30m） | 连接最长存活时间 |
+| `RESIN_DB_CONNECT_TIMEOUT` | 0（取 10s） | 建连超时 |
+
+`RESIN_STATE_DIR` 在 `postgres` 模式下不再使用；`RESIN_CACHE_DIR` 仍要保留——GeoIP 的 `.mmdb` 资产依然落在本地缓存目录（它不是关系数据，不进数据库）。
+
+### 准备数据库
+
+```sql
+CREATE ROLE resin LOGIN PASSWORD '换成一个强密码';
+CREATE DATABASE resin OWNER resin;
+```
+
+两个 schema 由 Resin 首次启动时自动创建并跑迁移；**两个 schema 必须位于同一个数据库**，因为启动时的跨库孤儿清理需要在一条事务里 JOIN 两张表（SQLite 版用的是 `ATTACH`）。
+
+```bash
+RESIN_DB_DRIVER=postgres \
+RESIN_DB_DSN='postgres://resin:密码@127.0.0.1:5432/resin?sslmode=disable' \
+RESIN_ADMIN_TOKEN=【管理面板密码】 \
+RESIN_PROXY_TOKEN=【代理密码】 \
+./resin
+```
+
+启动日志会打印一行 `persistence backend: postgres (postgres://resin:***@..., schema resin_state/resin_cache)`，`GET /api/v1/system/config` 也会返回 `db_driver` / `db_state_schema` / `db_cache_schema` / `db_target`（密码已脱敏）。
+
+### 把现有 SQLite 数据搬过去
+
+```bash
+# 1. 先做一次 dry-run，确认两边行数
+RESIN_DB_DSN='postgres://resin:密码@127.0.0.1:5432/resin?sslmode=disable' \
+  ./resin db-migrate \
+    --from-state  /var/lib/resin/state.db \
+    --from-cache  /var/cache/resin/cache.db \
+    --dry-run
+
+# 2. 正式搬运（可重复执行，逐表 upsert，不会删除目标已有行）
+RESIN_DB_DSN='postgres://resin:密码@127.0.0.1:5432/resin?sslmode=disable' \
+  ./resin db-migrate \
+    --from-state  /var/lib/resin/state.db \
+    --from-cache  /var/cache/resin/cache.db
+```
+
+搬运完成后会逐表核对行数，再跑一次跨库一致性清理。SQLite 侧的旧文件不会被修改，可原地留作回滚点；要回滚只需把 `RESIN_DB_DRIVER` 去掉，恢复用本地 `state.db` / `cache.db`。
+
+### 注意事项
+
+- `db-migrate` **只搬配置与状态**，不含请求日志与指标（它们本来就在本地）。
+- 布尔列在 PostgreSQL 中是 `BOOLEAN`，在 SQLite 中是 `INTEGER 0/1`，两种后端共用同一套 Go 代码；搬运时脚本会自动转换。
+- 多实例同时连同一个数据库时，`cache.db` 的脏集批量 flush 会有写竞争；Resin 对序列化失败/死锁做了整批重试，但**同一个平台的多实例共享租约属于未定义行为**，生产上建议一个数据库只接一个 Resin 实例。
+
+---
+
 ## 🛠️ 常见错误 (FAQ)
 
 - **Q: 如何让内网或本机目标不走代理节点？**
@@ -365,6 +432,15 @@ RESIN_PORT=2260 \
   - **A**: 目标无论是不是 ws/wss，URL 路径里的协议字段**依然只能写 `http` 或 `https`**（不能写 ws/wss）。Resin 会自动探测并完成 WebSocket 协议升级（Upgrade）。
 
 ---
+
+- **Q: 除了 SQLite 和 PostgreSQL 还支持别的数据库吗？**
+  - **A**: 不支持。`RESIN_DB_DRIVER` 只有 `sqlite` 与 `postgres` 两个取值：Resin 的 SQL 已经用 `ON CONFLICT ... excluded.*` 的写法，跟 PostgreSQL 一一对应；MySQL 需要另一套方言（`ON DUPLICATE KEY UPDATE`），因此没有纳入。
+- **Q: 切到 PostgreSQL 后 `state.db` / `cache.db` 还需要留着吗？**
+  - **A**: 不需要，配置与状态全部在数据库里。`RESIN_LOG_DIR` 下的 `metrics.db` 与 `request_logs-*.db` 仍然保留在本地，这是有意为之：日志和指标是高频追加、随流量增长的数据，不放进外部库。
+- **Q: 启动报 `db: state and cache schemas must differ`？**
+  - **A**: `RESIN_DB_STATE_SCHEMA` 与 `RESIN_DB_CACHE_SCHEMA` 必须不同名，因为一致性清理要按 schema 区分两张表。
+- **Q: `db-migrate` 跑完，UI 里没有数据？**
+  - **A**: 检查启动时的 `RESIN_DB_STATE_SCHEMA` / `RESIN_DB_CACHE_SCHEMA` 是否与 `db-migrate` 的 `--state-schema` / `--cache-schema` 一致（默认都是 `resin_state` / `resin_cache`）。`db-migrate` 也会打印每张表的 `source/written` 行数，可据此核对。
 
 ## ⚠️ 免责声明与许可证
 

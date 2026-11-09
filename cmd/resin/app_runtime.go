@@ -53,11 +53,15 @@ func run() error {
 		return err
 	}
 
-	engine, dbCloser, err := state.PersistenceBootstrap(envCfg.StateDir, envCfg.CacheDir)
+	engine, dbCloser, err := state.PersistenceBootstrapWith(state.BootstrapConfig{
+		StateDir: envCfg.StateDir,
+		CacheDir: envCfg.CacheDir,
+		DB:       dbConfigFromEnv(envCfg),
+	})
 	if err != nil {
 		return fmt.Errorf("persistence bootstrap: %w", err)
 	}
-	log.Println("Persistence bootstrap complete")
+	log.Printf("Persistence bootstrap complete (state/cache backend: %s)", envCfg.DBDriver)
 
 	app, err := newResinApp(envCfg, engine)
 	if err != nil {
@@ -598,4 +602,23 @@ func (a *resinApp) shutdown(ctx context.Context) {
 
 	a.flushWorker.Stop() // final cache flush before DB close
 	log.Println("Server stopped")
+}
+
+// dbConfigFromEnv maps the validated environment settings onto the persistence
+// layer's backend descriptor.
+func dbConfigFromEnv(envCfg *config.EnvConfig) state.DBConfig {
+	driver := state.DriverSQLite
+	if envCfg.DBDriver == string(state.DriverPostgres) {
+		driver = state.DriverPostgres
+	}
+	return state.DBConfig{
+		Driver:          driver,
+		DSN:             envCfg.DBDSN,
+		StateSchema:     envCfg.DBStateSchema,
+		CacheSchema:     envCfg.DBCacheSchema,
+		MaxOpenConns:    envCfg.DBMaxOpenConns,
+		MaxIdleConns:    envCfg.DBMaxIdleConns,
+		ConnMaxLifetime: envCfg.DBConnMaxLifetime,
+		ConnectTimeout:  envCfg.DBConnectTimeout,
+	}
 }

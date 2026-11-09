@@ -11,6 +11,13 @@ services:
       RESIN_PROXY_TOKEN: ${RESIN_PROXY_TOKEN}
       RESIN_LISTEN_ADDRESS: 0.0.0.0
       RESIN_PORT: 2260
+      # --- Persistence backend -------------------------------------------
+      # Default is local SQLite (volumes below). Uncomment these three lines to
+      # store config/state in PostgreSQL instead. Request logs and metrics
+      # always stay in the resin_log volume.
+      # RESIN_DB_DRIVER: postgres
+      # RESIN_DB_DSN: postgres://resin:${POSTGRES_PASSWORD}@postgres:5432/resin?sslmode=disable
+      # RESIN_DB_STATE_SCHEMA: resin_state
       # TZ: <Your Time Zone>
     ports:
       - "2260:2260"
@@ -25,7 +32,29 @@ services:
       retries: 3
       start_period: 20s
 
+  # Optional external database. It is behind the "postgres" profile so a plain
+  # `docker compose up` still runs SQLite-only:
+  #   docker compose --profile postgres up -d
+  # Resin creates the resin_state and resin_cache schemas itself.
+  postgres:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    container_name: resin-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: resin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-postgres}
+      POSTGRES_DB: resin
+    volumes:
+      - resin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resin -d resin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   resin_cache:
   resin_state:
   resin_log:
+  resin_pgdata:

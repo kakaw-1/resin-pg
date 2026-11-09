@@ -8,6 +8,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	migratedb "github.com/golang-migrate/migrate/v4/database"
+	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	migratesqlite "github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
@@ -15,6 +16,11 @@ import (
 const (
 	stateMigrationsPath = "migrations/state"
 	cacheMigrationsPath = "migrations/cache"
+
+	// PostgreSQL migration sets live in their own tree so that the iofs source
+	// for a given driver never sees two files with the same version.
+	pgStateMigrationsPath = "migrations/postgres/state"
+	pgCacheMigrationsPath = "migrations/postgres/cache"
 
 	// Keep these version markers in sync with SQL files under migrations/state/.
 	// stateLegacyBaselineVersion must remain fixed to the highest migration
@@ -34,22 +40,74 @@ const (
 	stateBaseSchemaMigration = stateMigrationsPath + "/000001_state_base.up.sql"
 )
 
-//go:embed migrations/state/*.sql migrations/cache/*.sql
+//go:embed migrations/state/*.sql migrations/cache/*.sql migrations/postgres
 var migrationsFS embed.FS
 
 type preMigrateHook func(db *sql.DB, driver migratedb.Driver) error
 
-// MigrateStateDB applies state.db migrations.
+// MigrateStateDB applies state.db migrations (SQLite).
 func MigrateStateDB(db *sql.DB) error {
 	return migrateSQLiteDB(db, stateMigrationsPath, migrateDefaultTable, prepareLegacyStateBaseline)
 }
 
-// MigrateCacheDB applies cache.db migrations.
+// MigrateCacheDB applies cache.db migrations (SQLite).
 func MigrateCacheDB(db *sql.DB) error {
 	return migrateSQLiteDB(db, cacheMigrationsPath, migrateDefaultTable, nil)
 }
 
+// migrateStateDBFor applies the state migrations for the given dialect.
+func migrateStateDBFor(db *sql.DB, driver Driver, schema string) error {
+	if driver == DriverPostgres {
+		return migratePostgresDB(db, pgStateMigrationsPath, schema)
+	}
+	return MigrateStateDB(db)
+}
+
+// migrateCacheDBFor applies the cache migrations for the given dialect.
+func migrateCacheDBFor(db *sql.DB, driver Driver, schema string) error {
+	if driver == DriverPostgres {
+		return migratePostgresDB(db, pgCacheMigrationsPath, schema)
+	}
+	return MigrateCacheDB(db)
+}
+
 const migrateDefaultTable = "schema_migrations"
+
+// migratePostgresDB applies an embedded migration set to a schema of an external
+// PostgreSQL database.
+//
+// Multi-statement migrations are enabled because the base-schema files create
+// several tables at once; the pgx driver's default extended-protocol execution
+// rejects more than one statement per round trip.
+func migratePostgresDB(db *sql.DB, fsPath, schema string) error {
+	if db == nil {
+		return fmt.Errorf("migrate %s: nil db", fsPath)
+	}
+
+	sourceDriver, err := iofs.New(migrationsFS, fsPath)
+	if err != nil {
+		return fmt.Errorf("migrate %s: init source: %w", fsPath, err)
+	}
+
+	dbDriver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{
+		MigrationsTable:       migrateDefaultTable,
+		SchemaName:            schema,
+		MultiStatementEnabled: true,
+	})
+	if err != nil {
+		return fmt.Errorf("migrate %s: init db driver: %w", fsPath, err)
+	}
+
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
+	if err != nil {
+		return fmt.Errorf("migrate %s: init migrator: %w", fsPath, err)
+	}
+
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("migrate %s: up: %w", fsPath, err)
+	}
+	return nil
+}
 
 func migrateSQLiteDB(db *sql.DB, fsPath, migrationsTable string, preHook preMigrateHook) error {
 	if db == nil {

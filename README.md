@@ -365,6 +365,73 @@ RESIN_PORT=2260 \
 
 ---
 
+## 🗄️ External Database (PostgreSQL)
+
+By default Resin keeps everything in local SQLite: `state.db` (config, platforms, subscriptions, rules, endpoints) and `cache.db` (node health, latency, leases). Pointing both at an external PostgreSQL server lets config and runtime state outlive the container and be shared across hosts.
+
+**Scope**: only config and state move. Request logs (`request_logs-*.db`, rotated by size) and metrics (`metrics.db`) **always stay on local files under `RESIN_LOG_DIR`**.
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RESIN_DB_DRIVER` | `sqlite` | `sqlite` or `postgres` |
+| `RESIN_DB_DSN` | empty | PostgreSQL DSN, e.g. `postgres://user:pw@host:5432/db?sslmode=disable`. Required when the driver is `postgres`. |
+| `RESIN_DB_STATE_SCHEMA` | `resin_state` | Schema holding strong-persist data (created automatically) |
+| `RESIN_DB_CACHE_SCHEMA` | `resin_cache` | Schema holding weak-persist data |
+| `RESIN_DB_MAX_OPEN_CONNS` | 0 (8 for postgres) | Pool size |
+| `RESIN_DB_MAX_IDLE_CONNS` | 0 (4 for postgres) | Idle connections |
+| `RESIN_DB_CONN_MAX_LIFETIME` | 0 (30m) | Maximum connection age |
+| `RESIN_DB_CONNECT_TIMEOUT` | 0 (10s) | Dial timeout |
+
+`RESIN_STATE_DIR` is unused in `postgres` mode. `RESIN_CACHE_DIR` is still used: GeoIP `.mmdb` assets stay on local disk (they are downloadable assets, not relational data).
+
+### Prepare the database
+
+```sql
+CREATE ROLE resin LOGIN PASSWORD 'a-strong-password';
+CREATE DATABASE resin OWNER resin;
+```
+
+Both schemas are created and migrated on first start. They **must live in the same database**: the startup orphan cleanup joins the state and cache tables inside one transaction (the SQLite build uses `ATTACH` for this).
+
+```bash
+RESIN_DB_DRIVER=postgres \
+RESIN_DB_DSN='postgres://resin:pw@127.0.0.1:5432/resin?sslmode=disable' \
+RESIN_ADMIN_TOKEN=<admin-token> \
+RESIN_PROXY_TOKEN=<proxy-token> \
+./resin
+```
+
+Startup logs `persistence backend: postgres (postgres://resin:***@..., schema resin_state/resin_cache)`, and `GET /api/v1/system/config` exposes `db_driver` / `db_state_schema` / `db_cache_schema` / `db_target` (credentials redacted).
+
+### Move existing SQLite data
+
+```bash
+# 1. Dry run first: compare row counts on both sides
+RESIN_DB_DSN='postgres://resin:pw@127.0.0.1:5432/resin?sslmode=disable' \
+  ./resin db-migrate \
+    --from-state /var/lib/resin/state.db \
+    --from-cache /var/cache/resin/cache.db \
+    --dry-run
+
+# 2. Copy for real (idempotent: per-table upsert, never deletes target rows)
+RESIN_DB_DSN='postgres://resin:pw@127.0.0.1:5432/resin?sslmode=disable' \
+  ./resin db-migrate \
+    --from-state /var/lib/resin/state.db \
+    --from-cache /var/cache/resin/cache.db
+```
+
+The command verifies per-table row counts afterwards and re-runs the cross-store cleanup. The SQLite files are left untouched, so rolling back is just dropping `RESIN_DB_DRIVER`.
+
+### Notes
+
+- `db-migrate` copies config and state only; request logs and metrics stay local by design.
+- Booleans are `BOOLEAN` on PostgreSQL and `INTEGER 0/1` on SQLite; both backends share one Go code path, and the copy converts values.
+- Two Resin instances writing the same database will contend on the dirty-set flush. Batches are retried on serialization failures/deadlocks, but **sharing leases for one platform across instances is undefined** — run one instance per database.
+
+---
+
 ## 🛠️ FAQ
 
 - **Q: How do I let LAN or localhost targets skip proxy nodes?**
@@ -379,6 +446,15 @@ RESIN_PORT=2260 \
   - **A**: In the URL path, the protocol field must still be `http` or `https` (not `ws`/`wss`). Resin auto-detects and handles WebSocket upgrade.
 
 ---
+
+- **Q: Are databases other than SQLite and PostgreSQL supported?**
+  - **A**: No. `RESIN_DB_DRIVER` accepts `sqlite` and `postgres` only: the SQL already uses `ON CONFLICT ... excluded.*`, which maps 1:1 onto PostgreSQL. MySQL would need a second dialect (`ON DUPLICATE KEY UPDATE`) and is out of scope.
+- **Q: Are `state.db` / `cache.db` still needed after switching to PostgreSQL?**
+  - **A**: No — config and state live in the database. `metrics.db` and `request_logs-*.db` under `RESIN_LOG_DIR` stay local on purpose: they are high-frequency, volume-growing data and are deliberately kept out of the external database.
+- **Q: Startup fails with `db: state and cache schemas must differ`?**
+  - **A**: `RESIN_DB_STATE_SCHEMA` and `RESIN_DB_CACHE_SCHEMA` must have different names; the consistency cleanup tells the two stores apart by schema.
+- **Q: `db-migrate` finished but the UI is empty?**
+  - **A**: Make sure the `RESIN_DB_STATE_SCHEMA` / `RESIN_DB_CACHE_SCHEMA` used at startup match the `--state-schema` / `--cache-schema` passed to `db-migrate` (both default to `resin_state` / `resin_cache`). `db-migrate` prints a `source/written` row count per table to check against.
 
 ## ⚠️ License and Disclaimer
 

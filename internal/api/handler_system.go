@@ -6,9 +6,16 @@ import (
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/service"
+	"github.com/Resinat/Resin/internal/state"
 )
 
 type systemEnvConfigResponse struct {
+	// Persistence backend. Metrics and request logs always stay on local files,
+	// so only the state/cache backend is reported here.
+	DBDriver                                        string          `json:"db_driver"`
+	DBStateSchema                                   string          `json:"db_state_schema,omitempty"`
+	DBCacheSchema                                   string          `json:"db_cache_schema,omitempty"`
+	DBTarget                                        string          `json:"db_target,omitempty"`
 	CacheDir                                        string          `json:"cache_dir"`
 	StateDir                                        string          `json:"state_dir"`
 	LogDir                                          string          `json:"log_dir"`
@@ -108,6 +115,10 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 	adminTokenSet := envCfg.AdminToken != ""
 	proxyTokenSet := envCfg.ProxyToken != ""
 	return &systemEnvConfigResponse{
+		DBDriver:                              envCfg.DBDriver,
+		DBStateSchema:                         dbSchemaForResponse(envCfg.DBDriver, envCfg.DBStateSchema),
+		DBCacheSchema:                         dbSchemaForResponse(envCfg.DBDriver, envCfg.DBCacheSchema),
+		DBTarget:                              state.RedactDSN(envCfg.DBDSN),
 		CacheDir:                              envCfg.CacheDir,
 		StateDir:                              envCfg.StateDir,
 		LogDir:                                envCfg.LogDir,
@@ -151,4 +162,12 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 		ProxyTokenWeak:                                  proxyTokenSet && config.IsWeakToken(envCfg.ProxyToken),
 		AuthVersion:                                     string(envCfg.AuthVersion),
 	}
+}
+
+// dbSchemaForResponse hides SQLite schema names, which have no meaning there.
+func dbSchemaForResponse(driver, schema string) string {
+	if driver != "postgres" {
+		return ""
+	}
+	return schema
 }
